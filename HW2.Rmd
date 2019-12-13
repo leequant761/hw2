@@ -1,0 +1,241 @@
+```{r, warning=FALSE, message=FALSE}
+library(RPostgreSQL)
+library(DBI)
+
+pgdrv <- dbDriver("PostgreSQL")
+PW <- as.character(read.table('pw.txt')[1,1])
+con <- dbConnect(pgdrv, dbname="dvdrental", 
+                 port="5432", 
+                 user="postgres", 
+                 password=PW, 
+                 host="localhost")
+```
+
+### 1. What are the top and least rented (in-demand) genres and what are their total sales?
+
+이 문제를 풀기 위해서는 `category`, `film_category`, `film`, `inventory`, `rental`을 서로 결합시켜야 한다.
+
+```{r, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(datamodelr)
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+category <- tbl(con, "category") %>% collect()
+film_category <- tbl(con, "film_category") %>% collect()
+film <- tbl(con, "film") %>% collect()
+inventory <- tbl(con, "inventory") %>% collect()
+rental <- tbl(con, "rental") %>% collect()
+
+top_genre <- dm_from_data_frames(category, film_category, film, inventory, rental)
+
+top_genre <- dm_add_references(
+  top_genre,
+  category$category_id == film_category$category_id,
+  film_category$film_id == film$film_id,
+  film$film_id == inventory$film_id,
+  inventory$inventory_id == rental$inventory_id
+)
+
+top_genre <- dm_create_graph(top_genre, rankdir = "LR", col_attr = c("column", "type"))
+dm_render_graph(top_genre)
+```
+
+```{r, warning=FALSE, message=FALSE}
+join_query <- "SELECT * FROM category AS c
+INNER JOIN film_category AS fc
+  ON c.category_id = fc.category_id
+INNER JOIN film AS f
+  ON fc.film_id = f.film_id
+INNER JOIN inventory AS iv
+  ON f.film_id = iv.film_id
+INNER JOIN rental AS r
+  ON iv.inventory_id = r.inventory_id"
+
+df1 <- dbGetQuery(con, join_query)
+```
+
+inner join을 할 경우에 중복되는 칼럼이 있다. 이를 제거하기 위해 
+```{r}
+df1 <- df1[, !duplicated(colnames(df1))]
+```
+
+```{r}
+result <- df1 %>% 
+  group_by(name) %>% # 장르별
+  summarise(num_rental = n(), sales = sum(rental_rate)) # 총 대여 횟수, 총 대여료
+
+DT::datatable(result)
+```
+
+`result`에 장르별 대여횟수나 판매액을 구했으므로 최고의 장르 최저의 장르를 구할 수 있게 된다.
+
+```{r}
+temp1 <- result %>% 
+  top_n(1, num_rental) %>%
+  select(name, num_rental)
+
+temp2 <- result %>% 
+  top_n(1, -num_rental) %>%
+  select(name, num_rental)
+
+rbind(temp1, temp2)
+```
+
+```{r}
+temp1 <- result %>% 
+  top_n(1, sales) %>%
+  select(name, sales)
+
+temp2 <- result %>% 
+  top_n(1, -sales) %>%
+  select(name, sales)
+
+rbind(temp1, temp2) # 최고 , 최저 대여
+```
+
+스포츠 장르가 가장 대여도 많고 판매액도 높다.
+
+### 2. Can we know how many distinct users have rented each genre?
+
+`df1`에 이미 customer_key, genre가 있으므로 이를 재활용하여 구할 수 있다.
+
+```{r}
+df2 <- df1
+```
+
+```{r}
+result <- df2 %>% 
+  group_by(name) %>% # 장르별
+  distinct(customer_id) %>% # 유니크한 customer_id observation만
+  summarise(n()) # 개수를 세라
+DT::datatable(result)
+```
+
+### 3. What is the average rental rate for each genre? (from the highest to the lowest)
+
+`df1`에 이미 film_id, rental_rate가 있으므로 이를 재활용하여 구할 수 있다.
+
+```{r}
+df3 <- df1
+```
+
+```{r}
+result <- df3 %>% 
+  group_by(name) %>% # 장르별
+  distinct(film_id, .keep_all = TRUE) %>% # 유니크한 film_id observation만
+  summarise(avg_r_rate = mean(rental_rate)) %>% #  average rental rate
+  arrange(-avg_r_rate) # 내림차순
+
+DT::datatable(result)
+```
+
+### 4. How many rented films were returned late, early, and on time?
+
+`df1`에 이미 film_id, rental_date, return_date, rental_duration가 있으므로 이를 재활용하여 구할 수 있다.
+
+```{r}
+df4 <- df1
+```
+
+**return late**
+
+```{r}
+temp <- df4 %>%
+  select(rental_date, return_date, rental_duration) %>%
+  transmute(rental_date = as.Date(rental_date), return_date = as.Date(return_date),
+            rental_duration = rental_duration) %>%
+  transmute(rent = return_date - rental_date, rental_duration = rental_duration) %>%
+  transmute(late = ifelse(rent > rental_duration, 1, 0),
+            ontime = ifelse(rent == rental_duration, 1, 0),
+            early = ifelse(rent < rental_duration, 1, 0))
+
+late <- sum(temp$late, na.rm=TRUE) # 183개의 observation에 return_date 결측치가 있다
+ontime <- sum(temp$ontime, na.rm=TRUE) # 183개의 observation에 return_date 결측치가 있다
+early <- sum(temp$early, na.rm=TRUE) # 183개의 observation에 return_date 결측치가 있다
+
+data.frame(late=late, ontime=ontime, early=early)
+```
+
+### 5. In which countries does **Rent A Film** have a presence and what is the customer base in each country? What are the total sales in each country? (from most to least)
+
+이 문제를 풀기 위해서는 `country`, `city`, `address`, `customer`, `payment`을 서로 결합시켜야 한다.
+
+```{r}
+country <- tbl(con, "country") %>% collect()
+city <- tbl(con, "city") %>% collect()
+address <- tbl(con, "address") %>% collect()
+customer <- tbl(con, "customer") %>% collect()
+payment <- tbl(con, "payment") %>% collect()
+
+customer_country <- dm_from_data_frames(country, city, address, customer, payment)
+
+customer_country <- dm_add_references(
+  customer_country,
+  country$country_id == city$country_id,
+  city$city_id == address$city_id,
+  address$address_id == customer$address_id,
+  customer$customer_id == payment$customer_id
+)
+
+customer_country <- dm_create_graph(customer_country, rankdir = "LR", col_attr = c("column", "type"))
+dm_render_graph(customer_country)
+```
+
+```{r}
+join_query <- "SELECT * FROM country AS c
+INNER JOIN city AS ct
+  ON c.country_id = ct.country_id
+INNER JOIN address AS ad
+  ON ct.city_id = ad.city_id
+INNER JOIN customer AS cus
+  ON ad.address_id = cus.address_id
+INNER JOIN payment AS py
+  ON cus.customer_id = py.customer_id"
+
+df5 <- dbGetQuery(con, join_query)
+```
+
+inner join을 할 경우에 중복되는 칼럼이 있다. 이를 제거하기 위해 
+```{r}
+df5 <- df5[, !duplicated(colnames(df5))]
+```
+
+```{r}
+df5 %>%
+  group_by(country_id) %>% # 국가별
+  summarise(total_sale = sum(amount)) # 총 구매액 = 판매액
+```
+
+```{r}
+result <- df5 %>%
+  group_by(country) %>% # 국가별
+  summarise(n_customer = n_distinct(customer_id), total_sale = sum(amount))
+
+DT::datatable(result)
+```
+
+### 6. Who are the top 5 customers per total sales and can we get their details just in case **Rent A Film** wants to reward them?
+
+`df5`에 이미 고객의 인적사항부터 구매액까지 있으므로 이를 재활용하여 구할 수 있다.
+
+```{r}
+df6 <- df5
+```
+
+```{r}
+result1 <- df6 %>%
+  group_by(customer_id) %>% # 고객 별
+  summarise(total_sales = sum(amount)) %>% # 실적
+  top_n(5)
+
+result2 <- df6 %>%
+  distinct(customer_id, .keep_all = TRUE) %>% # 고객의
+  select(country, city, address, phone, email, last_name, first_name, customer_id) %>% # 인적사항
+  mutate(name = paste(first_name, last_name)) %>% # with full name
+  select(-last_name, -first_name) # 이름 조각 제거
+
+DT::datatable(left_join(result1, result2))
+```
+
